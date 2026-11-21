@@ -29,7 +29,10 @@ field is clean, assembling from pieces only where the policy forces edits:
   never closes falls back to the reference's re-read-as-unquoted (`unterminated_quote`), and junk after a
   closing quote is appended by the unquoted reader (`quote_junk`, only when something was appended).
 - **Whole records** that sit on one physical line whose content holds no quote and no CR are cut directly
-  at their commas — no field in them can be quoted and no reading error can arise.
+  at their commas — no field in them can be quoted and no reading error can arise. The quote/CR test for
+  that fast path consults cached next-quote and next-CR positions, recomputed with `indexOf` only once
+  the scan has passed them, so the test stays linear even when quotes or CRs are absent (see the
+  worst-case fix below).
 - Width padding/cutting (`short_row` with `fields`, `long_row` with `extra`), blank-line skipping, the
   stray-CR-only line that is no record, BOM dropping, and every error's `{code, line, row}` shape and order
   match the reference exactly, including its property order.
@@ -53,3 +56,32 @@ Against the kit's practice instance (6 cases, ~10.2 MB of CSV):
   About **2.0× faster** than the baseline end to end; the `run()` phase alone profiles at roughly
   3.5–4× the reference's reading speed, the rest of the run being the JSON input/output both programs
   share.
+
+## Worst-case fix (this version)
+
+The first submitted version gated the whole-record fast path with a fresh `text.indexOf('"', pos)` and
+`text.indexOf('\r', pos)` on every record. When the character is absent, `indexOf` scans to the end of
+the text, so on quote-free (or CR-free) data the reading was quadratic in the input size — invisible on
+the practice set, where quotes are dense, but a clean 9 MB file took ~41 s of CPU. The gate now uses
+cached next-quote / next-CR positions (`nextQ` / `nextR`), each recomputed only once the scan position
+passes it, so every region of the text is scanned a bounded number of times and reading is linear in
+the worst case too.
+
+Semantics are unchanged: the practice answers above still match the reference exactly, the outputs on
+every set below are byte-identical to the previous version's, and 3,000 randomized broken inputs
+(quotes, stray CRs, CRLF/LF mixes, unterminated quotes, BOMs) agree with the previous version under
+both header modes.
+
+Process CPU time (user + sys) of the whole `node main.ts` run, median of 7 interleaved runs on this
+machine, min in parentheses:
+
+| set | previous version | this version |
+| --- | --- | --- |
+| practice set (6 cases, ~10.2 MB) | 0.905 s (0.810) | 0.908 s (0.823) |
+| clean, quote-free, 50k rows / 2.2 MB, single case | 2.234 s (2.208) | 0.255 s (0.240) |
+| clean, quote-free, 200k rows / 9.0 MB, single case | 40.973 s (39.912) | 0.502 s (0.459) |
+| mixed, a quoted field every ~50 records, 5.0 MB, single case | 6.236 s (6.124) | 0.380 s (0.366) |
+
+`run()` alone on the clean sets drops from ~2.09 s (50k rows, single cold run) and ~40 s (200k rows,
+the whole-run figure above is almost all `run()`) to a warm median of ~18 ms / ~220 ms (min 12 ms /
+51 ms) — linear, the same order as a purpose-built linear scanner.
