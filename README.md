@@ -16,26 +16,31 @@ every input — `{columns, rows, errors}` under the same broken-row policy — i
 
 ## How it works
 
-The reference reads one character at a time and builds each field a character at a time. This entry scans
-the same text once, left to right, but takes each field's value as one slice of the input whenever the
-field is clean, assembling from pieces only where the policy forces edits:
+The reference reads one character at a time and builds each field a character at a time. This entry moves
+the scanning into WebAssembly and keeps the materialization in JavaScript, where `slice` on the original
+string is the cheapest way to build a field:
 
-- **Unquoted fields** are scanned with `charCodeAt` to the next comma, LF or CR; with no stray CR met, the
-  value is a single `slice`. A stray CR (dropped, error `stray_cr`) splits the field into pieces that are
-  joined once.
-- **Quoted fields** first try a fast path: `indexOf` finds the next quote; if it is the closing quote and
-  the value slice holds no CR, the value is that one slice (the LFs inside are counted off the slice for
-  the line tally). Doubled quotes or CRs inside send the field down a piece-assembling path; a quote that
-  never closes falls back to the reference's re-read-as-unquoted (`unterminated_quote`), and junk after a
-  closing quote is appended by the unquoted reader (`quote_junk`, only when something was appended).
-- **Whole records** that sit on one physical line whose content holds no quote and no CR are cut directly
-  at their commas — no field in them can be quoted and no reading error can arise. The quote/CR test for
-  that fast path consults cached next-quote and next-CR positions, recomputed with `indexOf` only once
-  the scan has passed them, so the test stays linear even when quotes or CRs are absent (see the
-  worst-case fix below).
+- **Copy-in.** `run` writes the input text once into WASM linear memory as UTF-16 code units, using
+  `Buffer`'s native `utf16le` write straight into a view over that memory (~0.1 µs per KB, and it
+  preserves lone surrogates exactly — nothing is ever transcoded through UTF-8).
+- **WASM scanner.** A hand-written WAT module (1,568 bytes, embedded in `solve.js` as base64, compiled
+  and instantiated once at import) walks the code units once. It is a scalar state machine that mirrors
+  csv-reader's broken-input recovery exactly — stray CRs dropped with `stray_cr`, CRs inside quotes
+  read as LF, doubled quotes unescaped, junk after a closing quote kept with `quote_junk`, and a quote
+  that never closes re-read as an unquoted field with `unterminated_quote` — with a SWAR block skip
+  that only fast-forwards over code units provably free of the comma/CR/LF/quote specials and never
+  computes quote state itself. Instead of values, it writes a compact descriptor stream: record
+  markers with line numbers, field segments, literal characters, and errors in encounter order.
+- **JS consumer.** One pass over the stream slices the original string into the answer. A field that is
+  a single clean segment — quoted or not, escapes included by construction — is one `slice` behind a
+  packed two-word descriptor; only fields the policy forces edits on are assembled from pieces, joined
+  once. Data rows are preallocated to the first record's width and filled by index assignment.
 - Width padding/cutting (`short_row` with `fields`, `long_row` with `extra`), blank-line skipping, the
-  stray-CR-only line that is no record, BOM dropping, and every error's `{code, line, row}` shape and order
-  match the reference exactly, including its property order.
+  stray-CR-only line that is no record, BOM dropping, and every error's `{code, line, row}` shape and
+  order match the reference exactly, including its property order.
+- **Fallback.** The previous all-JS implementation (described in the sections below) is kept in the
+  same file: if WebAssembly or `Buffer` is unavailable, or the WASM call ever traps, `run` uses it
+  instead. Both paths return identical results.
 
 Nothing is kept from one call to the next: `run` is pure and self-contained per case.
 
@@ -85,3 +90,33 @@ machine, min in parentheses:
 `run()` alone on the clean sets drops from ~2.09 s (50k rows, single cold run) and ~40 s (200k rows,
 the whole-run figure above is almost all `run()`) to a warm median of ~18 ms / ~220 ms (min 12 ms /
 51 ms) — linear, the same order as a purpose-built linear scanner.
+
+## WASM scanning offload (this version)
+
+The all-JS reader above is now the fallback; the primary path is the WASM scanner described under
+"How it works". Semantics are unchanged: the practice answers still match the reference exactly
+(`answers.json` byte-identical to the JS version's), and 44,960 randomized broken inputs (lone
+surrogates, mid-text BOM, NUL, unterminated quotes, quote junk, stray CRs, CRLF mixes, empty lines,
+short and long rows) agree with the reference under both header modes, error objects compared
+byte-for-byte including key order.
+
+Measured on this machine, interleaved runs against the JS version:
+
+| measure | JS version | WASM version |
+| --- | --- | --- |
+| practice set, whole `node main.ts` run, wall median of 7 | 0.746 s | 0.596 s |
+| practice set, whole run, process CPU (user + sys) median of 7 | 0.901 s | 0.704 s |
+| practice set, `run()` only, median of 25 | 95.7 ms | 79.9 ms |
+
+`run()`-only medians on adversarial shapes (single-case inputs; the WASM path is faster on each):
+
+| set | JS version | WASM version |
+| --- | --- | --- |
+| clean, 200k rows / 10.2 MB | 150 ms | 139 ms |
+| quote-sparse (~1 quoted field per 50 records) / 9.4 MB | 73 ms | 66 ms |
+| quote-dense (escapes, embedded CRLF) / 3.7 MB | 44 ms | 42 ms |
+| wide, 500 columns × 2,000 rows / 7.3 MB | 225 ms | 218 ms |
+| non-ASCII heavy / 1.6 MB | 16 ms | 11 ms |
+
+Cold start: importing `solve.js` (base64 decode, WASM compile and instantiation included) takes
+~2 ms, under 1 ms more than the JS-only file.

@@ -1,8 +1,10 @@
 // A faster drop-in for csv-reader 1.0.0: run(input) returns exactly csv-reader's answer for every input —
 // {columns, rows, errors} under make.fun's broken-row policy — but reads the text in slices instead of a
-// character at a time. The text is scanned once, left to right, with charCodeAt; a field's value is taken as
-// one slice of the input whenever the field is clean, and assembled from pieces only when the broken-row
-// policy forces edits (a dropped stray CR, a doubled quote, a CR inside quotes read as LF).
+// character at a time. The text is scanned once, left to right; field ends are found with native indexOf
+// searches (a fresh scan for the next comma, cached scans for the next quote, CR and LF), so a clean field
+// costs one slice and no per-character loop. A field's value is taken as one slice of the input whenever
+// the field is clean, and assembled from pieces only when the broken-row policy forces edits (a dropped
+// stray CR, a doubled quote, a CR inside quotes read as LF).
 //
 // The policy, matched exactly:
 //   - a U+FEFF at the very start of the text is dropped;
@@ -33,7 +35,7 @@ const CH_CR = 13;
 const CH_QUOTE = 34;
 
 /** csv-reader 1.0.0's answer for one case's input {text, header}: {columns, rows, errors}. */
-export function run(input) {
+function runJS(input) {
   const text = String(input.text);
   const header = input.header === true;
   const n = text.length;
@@ -58,6 +60,7 @@ export function run(input) {
   // text whenever the character is absent, which makes reading quote-free or CR-free data quadratic.)
   let nextQ = -2;
   let nextR = -2;
+  let nextL = -2;
 
   // The field just read: its value, how it ended, and how many characters its last unquoted stretch kept.
   let fVal = '';
@@ -70,37 +73,50 @@ export function run(input) {
 
   // Reads unquoted characters onto `init` up to the next comma or line break: a CR not followed by LF is
   // dropped (stray_cr). Sets fVal, fEnded and fAdded (the characters kept by this read, not counting init).
+  // The end of the field is found with native searches: a fresh scan for the next comma (commas are
+  // dense) and the cached next-CR / next-LF scans, so a clean field costs one slice and no per-character
+  // loop. This reader never moves pos backwards, so the caches it advances stay valid.
   function readUnquoted(init) {
     let pieces = null; // slices kept so far, once a stray CR has split the field
     let added = 0;
     let start = pos;
     let i = pos;
     for (;;) {
-      while (i < n) {
-        const c = text.charCodeAt(i);
-        if (c === CH_COMMA || c === CH_LF || c === CH_CR) break;
-        i += 1;
+      const cm = text.indexOf(',', i);
+      if (nextR !== -1 && nextR < i) nextR = text.indexOf('\r', i);
+      if (nextL !== -1 && nextL < i) nextL = text.indexOf('\n', i);
+      // The common case: the field ends at its comma, with no CR or LF before it.
+      if (pieces === null && cm !== -1 && (nextR === -1 || cm < nextR) && (nextL === -1 || cm < nextL)) {
+        fVal = init + text.slice(start, cm);
+        fAdded = added + (cm - start);
+        pos = cm + 1;
+        fEnded = COMMA;
+        return;
       }
-      if (i >= n) {
-        fVal = pieces === null ? init + text.slice(start, i) : init + (pieces.push(text.slice(start, i)), pieces.join(''));
-        fAdded = added + (i - start);
-        pos = i;
+      let d = -1;
+      let dc = -1;
+      if (cm !== -1) { d = cm; dc = CH_COMMA; }
+      if (nextR !== -1 && (d === -1 || nextR < d)) { d = nextR; dc = CH_CR; }
+      if (nextL !== -1 && (d === -1 || nextL < d)) { d = nextL; dc = CH_LF; }
+      if (d === -1) {
+        fVal = pieces === null ? init + text.slice(start, n) : init + (pieces.push(text.slice(start, n)), pieces.join(''));
+        fAdded = added + (n - start);
+        pos = n;
         fEnded = END;
         return;
       }
-      const c = text.charCodeAt(i);
-      if (c === CH_COMMA || c === CH_LF || (c === CH_CR && i + 1 < n && text.charCodeAt(i + 1) === CH_LF)) {
-        fVal = pieces === null ? init + text.slice(start, i) : init + (pieces.push(text.slice(start, i)), pieces.join(''));
-        fAdded = added + (i - start);
-        if (c === CH_COMMA) {
-          pos = i + 1;
+      if (dc === CH_COMMA || dc === CH_LF || (dc === CH_CR && text.charCodeAt(d + 1) === CH_LF)) {
+        fVal = pieces === null ? init + text.slice(start, d) : init + (pieces.push(text.slice(start, d)), pieces.join(''));
+        fAdded = added + (d - start);
+        if (dc === CH_COMMA) {
+          pos = d + 1;
           fEnded = COMMA;
-        } else if (c === CH_LF) {
-          pos = i + 1;
+        } else if (dc === CH_LF) {
+          pos = d + 1;
           line += 1;
           fEnded = BREAK;
         } else {
-          pos = i + 2;
+          pos = d + 2;
           line += 1;
           fEnded = BREAK;
         }
@@ -109,9 +125,9 @@ export function run(input) {
       // A CR not followed by LF: dropped, and the field is assembled from pieces from here on.
       error('stray_cr');
       if (pieces === null) pieces = [];
-      pieces.push(text.slice(start, i));
-      added += i - start;
-      i += 1;
+      pieces.push(text.slice(start, d));
+      added += d - start;
+      i = d + 1;
       start = i;
     }
   }
@@ -248,7 +264,8 @@ export function run(input) {
     // closing CRLF. Then no field can be quoted, no error can arise while reading it, and its fields are
     // simply the line cut at its commas. (A quote anywhere on the line, or a CR anywhere else, sends the
     // record down the general path below, which reads it field by field.)
-    const lf = text.indexOf('\n', pos);
+    if (nextL !== -1 && nextL < pos) nextL = text.indexOf('\n', pos);
+    const lf = nextL;
     const lineEnd = lf === -1 ? n : lf;
     if (nextQ !== -1 && nextQ < pos) nextQ = text.indexOf('"', pos);
     if (nextQ === -1 || nextQ >= lineEnd) {
@@ -288,4 +305,140 @@ export function run(input) {
     endRecord(fields);
   }
   return { columns: header ? (columns ?? []) : null, rows, errors };
+}
+
+// ---------------------------------------------------------------------------
+// WASM scanning offload: the text is copied once into WASM memory as UTF-16 code units
+// (Buffer's utf16le conversion preserves lone surrogates exactly), a WASM scanner walks it
+// once and writes a compact descriptor stream (field segments, literal characters, errors,
+// record markers), and the consumer below slices the original string into the answer.
+// Any failure — no Buffer, no WebAssembly, a trap — falls back to runJS above, unchanged.
+// ---------------------------------------------------------------------------
+const WASM_B64 = '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';
+let wasmScan = null;
+let wasmMem = null;
+try {
+  const wasmBytes = Buffer.from(WASM_B64, 'base64');
+  const wasmInst = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {});
+  wasmScan = wasmInst.exports.scan;
+  wasmMem = wasmInst.exports.memory;
+} catch (e) {
+  wasmScan = null;
+}
+
+const ERR_CODES = ['stray_cr', 'quote_junk', 'unterminated_quote'];
+
+function runWasm(input) {
+  const text = String(input.text);
+  const header = input.header === true;
+  const n = text.length;
+  const streamOff = (2 * n + 3) & ~3;
+  const need = streamOff + 24 * n + 65536;
+  if (wasmMem.buffer.byteLength < need) {
+    wasmMem.grow(Math.ceil((need - wasmMem.buffer.byteLength) / 65536));
+  }
+  // Write the text straight into WASM memory as UTF-16 code units (native String::Write;
+  // preserves lone surrogates exactly). The view is created after any grow, never held across one.
+  Buffer.from(wasmMem.buffer, 0, 2 * n).write(text, 0, 2 * n, 'utf16le');
+  const words = wasmScan(n, streamOff);
+  const view = new Uint32Array(wasmMem.buffer, streamOff, words);
+
+  const errors = [];
+  const rows = [];
+  let columns = null;
+  let width = -1;
+  let i = 0;
+
+  while (i < words) {
+    // REC_START
+    const curLine = view[i + 1];
+    const curRow = header && columns === null ? null : rows.length;
+    i += 2;
+    const cap = width >= 0 ? width : 0;
+    const fields = new Array(cap);
+    let fi = 0;
+    let lastQuoted = 0;
+    let segState = 0; // 0: no pieces yet, 1: one segment pending, 2: assembling in parts
+    let pStart = 0;
+    let pLen = 0;
+    let parts = null;
+    for (;;) {
+      let tag = view[i];
+      if ((tag & 255) === 7) { // packed FIELD1 run: word = 7 | start<<8, next word = len | quoted<<24
+        do {
+          const st = tag >>> 8;
+          const w1 = view[i + 1];
+          const v = text.slice(st, st + (w1 & 0xffffff));
+          if (fi < cap) fields[fi] = v; else fields.push(v);
+          fi++;
+          lastQuoted = w1 >>> 24;
+          i += 2;
+          tag = view[i];
+        } while ((tag & 255) === 7);
+      }
+      if (tag === 6) { // REC_END
+        i += 1;
+        if (!(fi === 1 && fields[0] === '' && !lastQuoted)) {
+          if (width < 0) width = fi;
+          if (header && columns === null) {
+            columns = fields;
+          } else if (fi < width) {
+            errors.push({ code: 'short_row', line: curLine, row: curRow, fields: fi });
+            for (let k = fi; k < width; k++) fields[k] = '';
+            rows.push(fields);
+          } else if (fi > width) {
+            errors.push({ code: 'long_row', line: curLine, row: curRow, extra: fields.splice(width) });
+            rows.push(fields);
+          } else {
+            rows.push(fields);
+          }
+        }
+        break;
+      }
+      if (tag === 9) { // FIELD1X: one clean segment, unpacked (very large offset or field)
+        const v = text.slice(view[i + 1], view[i + 1] + view[i + 2]);
+        if (fi < cap) fields[fi] = v; else fields.push(v);
+        fi++;
+        lastQuoted = view[i + 3];
+        i += 4;
+      } else if (tag === 2) { // SEG
+        const s = view[i + 1];
+        const l = view[i + 2];
+        if (segState === 0) { pStart = s; pLen = l; segState = 1; }
+        else if (segState === 1) { parts = [text.slice(pStart, pStart + pLen), text.slice(s, s + l)]; segState = 2; }
+        else parts.push(text.slice(s, s + l));
+        i += 3;
+      } else if (tag === 4) { // FIELD_END
+        const v = segState === 0 ? '' : segState === 1 ? text.slice(pStart, pStart + pLen) : parts.join('');
+        if (fi < cap) fields[fi] = v; else fields.push(v);
+        fi++;
+        lastQuoted = view[i + 1];
+        segState = 0;
+        parts = null;
+        i += 2;
+      } else if (tag === 3) { // LIT
+        const ch = view[i + 1] === 34 ? '"' : '\n';
+        if (segState === 0) { parts = [ch]; segState = 2; }
+        else if (segState === 1) { parts = [text.slice(pStart, pStart + pLen), ch]; segState = 2; }
+        else parts.push(ch);
+        i += 2;
+      } else { // ERROR (5)
+        errors.push({ code: ERR_CODES[view[i + 1]], line: curLine, row: curRow });
+        i += 2;
+      }
+    }
+  }
+  return { columns: header ? (columns ?? []) : null, rows, errors };
+}
+
+let wasmFailed = false;
+export function run(input) {
+  if (!wasmFailed && wasmScan !== null && typeof Buffer !== 'undefined') {
+    try {
+      return runWasm(input);
+    } catch (e) {
+      wasmFailed = true;
+    }
+  }
+  return runJS(input);
 }
